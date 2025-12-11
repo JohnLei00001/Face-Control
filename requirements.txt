@@ -1,0 +1,4 @@
+opencv-contrib-python==4.10.0.84
+numpy>=1.26
+pynput>=1.7
+mediapipe>=0.10
