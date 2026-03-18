@@ -7,7 +7,6 @@ import urllib.request
 from collections import deque
 import cv2
 import numpy as np
-from pynput.mouse import Controller, Button
 
 class OneEuro:
     def __init__(self, min_cutoff=1.4, beta=0.2, d_cutoff=1.5):
@@ -48,12 +47,13 @@ def clamp(v, lo, hi):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--camera", type=int, default=0)
-    parser.add_argument("--sensitivity", type=float, default=3.0)
-    parser.add_argument("--smoothing", type=float, default=0.35)
+    parser.add_argument("--dry_run", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--sensitivity", type=float, default=3.5)
+    parser.add_argument("--smoothing", type=float, default=0.6)
     parser.add_argument("--deadzone", type=float, default=0.02)
-    parser.add_argument("--dwell", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--dwell_ms", type=int, default=900)
-    parser.add_argument("--dwell_radius", type=int, default=10)
+    parser.add_argument("--dwell", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dwell_ms", type=int, default=1000)
+    parser.add_argument("--dwell_radius", type=int, default=30)
     parser.add_argument("--invert_x", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--invert_y", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--gamma_x", type=float, default=0.6)
@@ -68,7 +68,7 @@ def main():
     parser.add_argument("--alpha_gain", type=float, default=4.0)
     parser.add_argument("--alpha_min", type=float, default=0.08)
     parser.add_argument("--alpha_max", type=float, default=0.6)
-    parser.add_argument("--stick_guard", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--stick_guard", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--stick_enter", type=float, default=0.010)
     parser.add_argument("--stick_exit", type=float, default=0.006)
     parser.add_argument("--snap_px", type=float, default=2.0)
@@ -94,8 +94,14 @@ def main():
     parser.add_argument("--ear_open_ratio", type=float, default=0.70)
     parser.add_argument("--pipeline", type=str, default="auto")
     parser.add_argument("--max_runtime", type=float, default=0.0)
-    parser.add_argument("--show", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--show", action=argparse.BooleanOptionalAction, default=False)
     args = parser.parse_args()
+    if args.dry_run:
+        return
+
+    print("头部控制鼠标已启动！正在后台运行...")
+    print("提示：默认隐藏摄像头窗口。若需退出程序，请在终端按 Ctrl+C。")
+    print("若需重新显示摄像头画面，请在运行时添加参数：--show")
 
     cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
     if not cap.isOpened():
@@ -104,6 +110,7 @@ def main():
 
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
     eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye_tree_eyeglasses.xml")
+    from pynput.mouse import Controller, Button
     mouse = Controller()
     sw, sh = get_screen_size()
 
@@ -113,6 +120,7 @@ def main():
     last_pos = np.array([float(neutral_cursor[0]), float(neutral_cursor[1])])
     dwell_enabled = args.dwell
     dwell_start = None
+    dwell_anchor = None
     dwell_cooldown_until = 0.0
     controlling = True
 
@@ -257,8 +265,9 @@ def main():
                 mx = pts_xy.max(axis=0)
                 x = int(mn[0]); y = int(mn[1])
                 fw = int(mx[0] - mn[0]); fh = int(mx[1] - mn[1])
-                cx = x + fw // 2
-                cy = y + fh // 2
+                # Use nose tip (landmark 4) for much more stable and accurate tracking
+                cx = int(pts_xy[4][0])
+                cy = int(pts_xy[4][1])
                 last_face = (x, y, fw, fh)
                 def ear_from_xy(p):
                     p = np.asarray(p, dtype=np.float32)
@@ -404,34 +413,37 @@ def main():
                 if controlling:
                     mouse.position = (int(pos[0]), int(pos[1]))
                 moved = np.linalg.norm(pos - last_pos)
-                if dwell_enabled and controlling and not blink_click:
-                    if moved < args.dwell_radius:
-                        if dwell_start is None:
-                            dwell_start = now
-                        if now - dwell_start >= args.dwell_ms / 1000.0 and now >= dwell_cooldown_until:
-                            mouse.click(Button.left, 1)
-                            dwell_cooldown_until = now + 0.6
-                            dwell_start = None
-                    else:
-                        dwell_start = None
+                if dwell_enabled and controlling:
+                    if dwell_anchor is None:
+                        dwell_anchor = pos.copy()
+                        dwell_start = now
+                    
+                    if np.linalg.norm(pos - dwell_anchor) > float(args.dwell_radius):
+                        # Moved outside radius, reset anchor and timer
+                        dwell_anchor = pos.copy()
+                        dwell_start = now
+                    elif (now - dwell_start) >= (args.dwell_ms / 1000.0) and now >= dwell_cooldown_until:
+                        # Stayed inside radius long enough
+                        mouse.click(Button.left, 1)
+                        dwell_cooldown_until = now + 1.0  # 1 second cooldown after click
+                        dwell_anchor = pos.copy()
+                        dwell_start = now
                 if ear_for_blink > 0.0:
                     ear_f = fe.filter(ear_for_blink, now)
                     ear_f_last = ear_f
-                    if auto_ear and now <= ear_calib_until:
-                        ear_open_sum += max(ear_f, 0.0)
-                        ear_open_cnt += 1
-                        if ear_open_cnt > 15:
-                            ear_thresh = (ear_open_sum / max(1, ear_open_cnt)) * 0.75
-                    if auto_ear:
-                        ear_hist.append(max(ear_f, 0.0))
-                        if len(ear_hist) >= 20:
-                            hist = np.array(list(ear_hist), dtype=np.float32)
-                            open_est = float(np.percentile(hist, 75))
-                            close_est = float(np.percentile(hist, 10))
-                            gap = max(1e-6, open_est - close_est)
-                            ear_lo_dyn = close_est + ear_close_ratio * gap
-                            ear_hi_dyn = close_est + max(ear_close_ratio + 0.05, ear_open_ratio) * gap
-                            ear_dyn_ready = True
+                    
+                    # Simple robust adaptive EAR threshold
+                    if not hasattr(blink, 'max_ear'):
+                        blink.max_ear = ear_f
+                    # Slowly adapt max_ear to current ear_f to handle lighting/angle changes
+                    blink.max_ear = blink.max_ear * 0.995 + ear_f * 0.005
+                    if ear_f > blink.max_ear:
+                        blink.max_ear = ear_f
+                        
+                    # Set thresholds relative to the user's maximum open eye ratio
+                    ear_lo_dyn = blink.max_ear * 0.65 # 65% of max is closed
+                    ear_hi_dyn = blink.max_ear * 0.85 # 85% of max is open
+                    ear_dyn_ready = True
                     if blink_freeze:
                         closed_low_f = ear_f > 0.0 and ear_f < (ear_lo_dyn if ear_dyn_ready else ear_thresh)
                         open_high_f = ear_f > (ear_hi_dyn if ear_dyn_ready else (ear_thresh + ear_high_delta))
@@ -439,7 +451,7 @@ def main():
                             blink_active = True
                         elif blink_active and open_high_f:
                             blink_active = False
-                    if blink_click and controlling:
+                    if blink_click and controlling and (not dwell_enabled):
                         allow = blink_when_moving or (not moving_stick)
                         if allow:
                             ear_lo_cur = ear_lo_dyn if ear_dyn_ready else ear_thresh
@@ -455,7 +467,7 @@ def main():
             status = []
             status.append(f"calib={'OK' if neutral_center else '...'}")
             status.append(f"control={'ON' if controlling else 'OFF'}")
-            status.append(f"dwell={'ON' if dwell_enabled and not blink_click else 'OFF'}")
+            status.append(f"dwell={'ON' if dwell_enabled else 'OFF'}")
             status.append(f"sens={args.sensitivity:.2f}")
             status.append(f"invX={'Y' if invert_x else 'N'}")
             status.append(f"invY={'Y' if invert_y else 'N'}")
@@ -489,6 +501,15 @@ def main():
                 cw = min(cool_left, blink_cooldown)
                 fill_w2 = int(bar_w * (cw / blink_cooldown))
                 cv2.rectangle(frame, (bx, by2), (bx + fill_w2, by2 + bar_h), (0, 128, 255), -1)
+            if dwell_enabled and dwell_anchor is not None:
+                fx0 = int(clamp((dwell_anchor[0] / float(sw)) * w, 0, w - 1))
+                fy0 = int(clamp((dwell_anchor[1] / float(sh)) * h, 0, h - 1))
+                r = max(15, int((args.dwell_radius / float(sw)) * w))
+                cv2.circle(frame, (fx0, fy0), r, (80, 80, 80), 2)
+                now_ring = time.time()
+                if dwell_start is not None and now_ring >= dwell_cooldown_until:
+                    prog = clamp((now_ring - dwell_start) / max(1e-6, args.dwell_ms / 1000.0), 0.0, 1.0)
+                    cv2.ellipse(frame, (fx0, fy0), (r, r), -90, 0, int(360 * prog), (0, 255, 0), 4)
             cv2.imshow("Head Mouse", frame)
             k = cv2.waitKey(1) & 0xFF
             if k == ord('q'):
@@ -530,4 +551,7 @@ def main():
             pass
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n程序已退出。")
